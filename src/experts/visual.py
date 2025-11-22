@@ -10,9 +10,10 @@ class VisualExpert(nn.Module):
     The 'Eye' of the system. 
     Handles Detection, Optical Flow, and Visual Feature Extraction.
     """
-    def __init__(self, device='cuda' if torch.cuda.is_available() else 'cpu'):
+    def __init__(self, device='cuda' if torch.cuda.is_available() else 'cpu', use_raft=True):
         super().__init__()
         self.device = device
+        self.use_raft = use_raft
         
         # 1. Object Detector (YOLOv5/v8)
         self.use_yolo = None
@@ -31,16 +32,19 @@ class VisualExpert(nn.Module):
         # 2. Optical Flow (RAFT)
         self.flow_model = None
         self.prev_frame_tensor = None
-        try:
-            from torchvision.models.optical_flow import raft_small
-            # Weights enum is usually Raft_Small_Weights.DEFAULT or similar in newer torchvision
-            # We'll try loading with pretrained=True (deprecated but often works) or weights string
-            self.flow_model = raft_small(pretrained=True)
-            self.flow_model = self.flow_model.to(device)
-            self.flow_model.eval()
-            print("VisualExpert: Loaded RAFT (small) successfully.")
-        except Exception as e:
-            print(f"VisualExpert: Failed to load RAFT ({e}). Flow will be zero.")
+        if self.use_raft:
+            try:
+                from torchvision.models.optical_flow import raft_small
+                # Weights enum is usually Raft_Small_Weights.DEFAULT or similar in newer torchvision
+                # We'll try loading with pretrained=True (deprecated but often works) or weights string
+                self.flow_model = raft_small(pretrained=True)
+                self.flow_model = self.flow_model.to(device)
+                self.flow_model.eval()
+                print("VisualExpert: Loaded RAFT (small) successfully.")
+            except Exception as e:
+                print(f"VisualExpert: Failed to load RAFT ({e}). Flow will be zero.")
+        else:
+            print("VisualExpert: RAFT disabled. Using Farneback (OpenCV) for flow.")
         
         # 3. Visual Encoder (ResNet18 as feature extractor)
         # Replaced basic CNN with ResNet18 for better features
@@ -73,6 +77,17 @@ class VisualExpert(nn.Module):
             nn.Linear(128, 3), 
             nn.Sigmoid() # Normalized 0-1 for friction/restitution, scale mass later
         ).to(device)
+        
+        # Bus projections (for cross-expert KV sharing)
+        self.bus_dim = 128
+        self.k_proj = nn.Linear(self.encoder_dim, self.bus_dim).to(device)
+        self.v_proj = nn.Linear(self.encoder_dim, self.bus_dim).to(device)
+        self._last_embeddings = None
+
+        # 5. KV projections for Attention Bus
+        self.d_model = 128
+        self.k_proj = nn.Linear(self.encoder_dim, self.d_model).to(device)
+        self.v_proj = nn.Linear(self.encoder_dim, self.d_model).to(device)
 
     def detect(self, frame: np.ndarray) -> List[Dict]:
         """
@@ -139,9 +154,27 @@ class VisualExpert(nn.Module):
             props.append(prop)
             
         if not embeddings:
+            self._last_embeddings = torch.empty(0, self.encoder_dim, device=self.device)
             return torch.empty(0, 512), torch.empty(0, 3)
-            
-        return torch.stack(embeddings), torch.stack(props)
+        
+        embs = torch.stack(embeddings)
+        self._last_embeddings = embs
+        return embs, torch.stack(props)
+
+    def produce_kv(self, embeddings: torch.Tensor = None):
+        """Produce key/value tensors for the bus from embeddings.
+
+        embeddings: [N, E]
+        returns k: [N, D], v: [N, D]
+        """
+        if embeddings is None:
+            embeddings = self._last_embeddings
+        if embeddings is None or embeddings.numel() == 0:
+            return torch.empty((0, self.bus_dim), device=self.device), torch.empty((0, self.bus_dim), device=self.device)
+
+        k = self.k_proj(embeddings)
+        v = self.v_proj(embeddings)
+        return k, v
 
     def compute_flow(self, current_frame_tensor: torch.Tensor) -> torch.Tensor:
         """
@@ -149,15 +182,31 @@ class VisualExpert(nn.Module):
         Input tensors should be [1, 3, H, W] in range [0, 255].
         Returns flow [2, H, W].
         """
-        if self.flow_model is None or self.prev_frame_tensor is None:
+        if self.prev_frame_tensor is None:
             return torch.zeros(2, current_frame_tensor.shape[2], current_frame_tensor.shape[3], device=self.device)
         
-        with torch.no_grad():
-            # RAFT expects images to be contiguous
-            list_of_flows = self.flow_model(self.prev_frame_tensor, current_frame_tensor)
-            predicted_flow = list_of_flows[-1][0] # [2, H, W]
+        if self.flow_model is not None:
+            # Use RAFT
+            with torch.no_grad():
+                # RAFT expects images to be contiguous
+                list_of_flows = self.flow_model(self.prev_frame_tensor, current_frame_tensor)
+                predicted_flow = list_of_flows[-1][0] # [2, H, W]
+            return predicted_flow
+        else:
+            # Use Farneback (CPU fallback)
+            # Convert tensors to numpy grayscale
+            prev_gray = self._tensor_to_gray_numpy(self.prev_frame_tensor)
+            curr_gray = self._tensor_to_gray_numpy(current_frame_tensor)
             
-        return predicted_flow
+            flow = cv2.calcOpticalFlowFarneback(prev_gray, curr_gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+            # flow is [H, W, 2], convert to [2, H, W] tensor
+            flow_tensor = torch.from_numpy(flow).permute(2, 0, 1).to(self.device)
+            return flow_tensor
+
+    def _tensor_to_gray_numpy(self, tensor):
+        # tensor: [1, 3, H, W], 0-255
+        img = tensor.squeeze(0).permute(1, 2, 0).cpu().numpy().astype(np.uint8)
+        return cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
 
     def estimate_camera_motion(self, flow: torch.Tensor) -> torch.Tensor:
         """
@@ -234,3 +283,15 @@ class VisualExpert(nn.Module):
             new_nodes.append(node)
             
         return new_nodes, camera_pose, global_flow
+
+    def produce_kv(self, embeddings: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Produce key/value tensors from per-object embeddings.
+        embeddings: [N, encoder_dim]
+        returns k:[N, d_model], v:[N, d_model]
+        """
+        if embeddings.numel() == 0:
+            return torch.empty((0, self.d_model), device=self.device), torch.empty((0, self.d_model), device=self.device)
+        k = self.k_proj(embeddings)
+        v = self.v_proj(embeddings)
+        return k, v

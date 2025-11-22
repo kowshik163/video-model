@@ -7,15 +7,17 @@ class Supervisor(nn.Module):
     The 'Brain'.
     Monitors consistency and routes compute.
     """
-    def __init__(self, consistency_threshold=0.5):
+    def __init__(self, consistency_threshold=0.5, bus_dim=128):
         super().__init__()
         self.consistency_threshold = consistency_threshold
         
         # Policy Network (for RL/Gumbel-Softmax routing)
-        # Input: [consistency_score, scene_complexity_score]
+        # Input: [consistency_score, scene_complexity_score, bus_context_dim]
         # Output: [prob_fast_path, prob_3d_path]
         self.policy_net = nn.Sequential(
-            nn.Linear(2, 16),
+            nn.Linear(2 + bus_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 16),
             nn.ReLU(),
             nn.Linear(16, 2),
             nn.Softmax(dim=1)
@@ -42,7 +44,7 @@ class Supervisor(nn.Module):
             
         return (loss / count).item()
 
-    def decide_routing(self, consistency_score: float, complexity_score: float = 0.5) -> Tuple[bool, torch.Tensor]:
+    def decide_routing(self, consistency_score: float, complexity_score: float = 0.5, bus_context: torch.Tensor = None) -> Tuple[bool, torch.Tensor]:
         """
         Decides whether to trigger the 3D Expert.
         Returns (needs_3d, action_probs)
@@ -52,7 +54,15 @@ class Supervisor(nn.Module):
             return True, torch.tensor([0.0, 1.0])
             
         # 2. Learned Policy (Training)
-        input_tensor = torch.tensor([consistency_score, complexity_score]).unsqueeze(0)
+        if bus_context is None:
+            # Fallback if no bus context provided
+            bus_context = torch.zeros(1, 128, device=self.policy_net[0].weight.device)
+            
+        input_tensor = torch.cat([
+            torch.tensor([[consistency_score, complexity_score]], device=bus_context.device),
+            bus_context
+        ], dim=1)
+        
         probs = self.policy_net(input_tensor)
         
         # Sample action (Gumbel-Softmax would go here for training)

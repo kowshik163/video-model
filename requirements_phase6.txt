@@ -1,0 +1,8 @@
+torch>=1.12
+torchvision
+numpy
+scikit-image
+librosa
+kubric  # optional, only if you plan to generate the full synthetic dataset
+opencv-python
+tqdm

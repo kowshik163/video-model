@@ -29,6 +29,9 @@ class ObjectNode:
     # Metadata
     last_seen_timestamp: float = 0.0
     is_active: bool = True
+    
+    # Flexible attributes for experts
+    attributes: Dict[str, Any] = field(default_factory=dict)
 
     def to_tensor(self) -> torch.Tensor:
         """Concatenates state into a single tensor for GNN input."""

@@ -74,10 +74,36 @@ class GeometryExpert(nn.Module):
             # Higher value = closer. 
             refined_depth = 100.0 / (depth_val + 1e-6)
             
+            # Estimate 3D Bounding Box (Heuristic)
+            # Assume object is roughly cubic in the crop
+            # Size in pixels
+            h_px, w_px = input_batch.shape[2], input_batch.shape[3]
+            # Back-project to 3D size using simple pinhole approximation
+            # Z = f * H / h_px -> H = Z * h_px / f
+            # Assume f ~ 1000 (normalized coords)
+            focal_length = 1000.0
+            H_world = refined_depth * h_px / focal_length
+            W_world = refined_depth * w_px / focal_length
+            D_world = (H_world + W_world) / 2.0 # Assume depth extent is average of H and W
+            
+            # Construct 8 corners relative to center
+            # Center is (0,0, refined_depth) in local camera frame
+            half_w, half_h, half_d = W_world / 2, H_world / 2, D_world / 2
+            bbox_3d = torch.tensor([
+                [-half_w, -half_h, -half_d], [half_w, -half_h, -half_d],
+                [half_w, half_h, -half_d], [-half_w, half_h, -half_d],
+                [-half_w, -half_h, half_d], [half_w, -half_h, half_d],
+                [half_w, half_h, half_d], [-half_w, half_h, half_d]
+            ], device=self.device) + torch.tensor([0, 0, refined_depth], device=self.device)
+            
+            # Estimate Contact Points (Bottom of the object)
+            # Lowest Y points in the 3D box
+            contact_points = bbox_3d[[2, 3, 6, 7]] # Bottom face corners (assuming Y down)
+            
             return {
                 "refined_depth": refined_depth.view(1),
-                "contact_points": [],
-                "3d_bbox": torch.zeros(8, 3)
+                "contact_points": contact_points,
+                "3d_bbox": bbox_3d
             }
             
         except Exception as e:

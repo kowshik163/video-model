@@ -39,6 +39,17 @@ class PhysicsExpert(nn.Module):
         
         self.frozen = False
         self.use_newtonian_residual = True # Use GNN as residual to Newtonian physics
+        # KV projections for Attention Bus (graph-level summaries)
+        self.d_model = 128
+        self.k_proj = nn.Linear(hidden_dim, self.d_model)
+        self.v_proj = nn.Linear(hidden_dim, self.d_model)
+
+    def freeze(self):
+        """Freezes parameters to prevent updates during real-world fine-tuning."""
+        self.frozen = True
+        for param in self.parameters():
+            param.requires_grad = False
+        self.eval()
 
     def load_weights(self, path: str):
         """Loads pretrained weights (e.g. from Kubric Sim)."""
@@ -78,6 +89,20 @@ class PhysicsExpert(nn.Module):
         
         return gnn_deltas
 
+    def produce_kv(self, node_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Produce a set of keys/values from node states (after encoding).
+        node_states: [N, input_dim]
+        returns k:[N, d_model], v:[N, d_model]
+        """
+        if node_states.numel() == 0:
+            return torch.empty((0, self.d_model)), torch.empty((0, self.d_model))
+        with torch.no_grad():
+            h = self.node_encoder(node_states)  # [N, hidden]
+            k = self.k_proj(h)
+            v = self.v_proj(h)
+        return k, v
+
     def predict_next_state(self, graph: SceneGraph, dt: float) -> torch.Tensor:
         """
         Wrapper to convert SceneGraph to tensors and run forward pass.
@@ -95,9 +120,11 @@ class PhysicsExpert(nn.Module):
         
         # Build fully connected edge index (simplified)
         num_nodes = len(nodes)
+        device = node_tensors.device
+        
         if num_nodes > 1:
             # Create all pairs
-            adj = torch.ones(num_nodes, num_nodes) - torch.eye(num_nodes)
+            adj = torch.ones(num_nodes, num_nodes, device=device) - torch.eye(num_nodes, device=device)
             edge_index = adj.nonzero().t()
             
             # Calculate distances for edge attributes
@@ -106,8 +133,8 @@ class PhysicsExpert(nn.Module):
             dist = torch.norm(pos[row] - pos[col], dim=1, keepdim=True)
             edge_attr = dist
         else:
-            edge_index = torch.empty((2, 0), dtype=torch.long)
-            edge_attr = torch.empty((0, 1))
+            edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
+            edge_attr = torch.empty((0, 1), device=device)
 
         # Run model
         gnn_deltas = self(node_tensors, edge_index, edge_attr)
@@ -158,3 +185,23 @@ class PhysicsExpert(nn.Module):
         # MSE
         error = torch.mean((pred_vel - obs_vel) ** 2)
         return error.item()
+
+    def forward_dummy(self, state_input: torch.Tensor) -> torch.Tensor:
+        """
+        Direct forward pass for simple training (single object, no edges).
+        Args:
+            state_input: (B, 9) [pos, vel, mass, friction, restitution]
+        Returns:
+            delta_state: (B, 6) [d_pos, d_vel]
+        """
+        # Encode node
+        node_feat = self.node_encoder(state_input) # (B, H)
+        
+        # No edges in this dummy mode
+        aggregated_edges = torch.zeros_like(node_feat)
+        
+        # Update
+        combined = torch.cat([node_feat, aggregated_edges], dim=1)
+        delta = self.node_updater(combined) # (B, 6)
+        
+        return delta

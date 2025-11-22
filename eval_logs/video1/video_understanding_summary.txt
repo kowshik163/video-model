@@ -1,0 +1,8 @@
+--- Video Understanding Summary: video1 ---
+Total Frames Processed: 973
+Unique Objects Tracked: 8
+3D Expert Triggers: 6 (0.6% of frames)
+
+Narrative:
+The video contains 8 distinct entities.
+The scene was relatively stable, handled mostly by the fast visual-physics loop.
