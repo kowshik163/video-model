@@ -295,3 +295,119 @@ class VisualExpert(nn.Module):
         k = self.k_proj(embeddings)
         v = self.v_proj(embeddings)
         return k, v
+
+    def refine_with_slots(self, frame: np.ndarray, predicted_slots: List[Dict]) -> List[ObjectNode]:
+        """
+        Performs targeted detection based on predicted slot locations.
+        Used to recover objects lost by the global detector.
+        
+        predicted_slots: List of dicts with 'bbox' (predicted), 'id', and optionally 'embedding'.
+        """
+        recovered_nodes = []
+        if not predicted_slots:
+            return recovered_nodes
+
+        # YOLOv5 expects RGB
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        for slot in predicted_slots:
+            # Define search region (e.g., 2x the predicted bbox)
+            pred_bbox = slot['bbox']
+            x1, y1, x2, y2 = pred_bbox
+            w_box, h_box = x2 - x1, y2 - y1
+            
+            # Expand search region
+            margin_w = w_box * 0.5
+            margin_h = h_box * 0.5
+            
+            sx1 = max(0, int(x1 - margin_w))
+            sy1 = max(0, int(y1 - margin_h))
+            sx2 = min(frame.shape[1], int(x2 + margin_w))
+            sy2 = min(frame.shape[0], int(y2 + margin_h))
+            
+            if sx2 <= sx1 or sy2 <= sy1:
+                continue
+                
+            # Crop
+            search_crop = frame_rgb[sy1:sy2, sx1:sx2]
+            
+            # Run Detector on Crop (Lower threshold implicitly by being closer/focused?)
+            # Actually, we might want to lower the conf threshold if possible, 
+            # but standard YOLO call uses default.
+            # However, zooming in often helps small objects.
+            
+            try:
+                if self.use_yolo == "v5":
+                    results = self.detector(search_crop)
+                    preds = results.xyxy[0].cpu().numpy()
+                    
+                    # Filter and adjust coordinates
+                    best_det = None
+                    best_iou = 0.0
+                    
+                    for *xyxy, conf, cls in preds:
+                        # Local coords
+                        lx1, ly1, lx2, ly2 = xyxy
+                        
+                        # Global coords
+                        gx1, gy1, gx2, gy2 = lx1 + sx1, ly1 + sy1, lx2 + sx1, ly2 + sy1
+                        
+                        # Check overlap with predicted bbox to ensure we found the RIGHT object
+                        # (Simple IoU check with the prediction)
+                        # Intersection
+                        ix1 = max(x1, gx1); iy1 = max(y1, gy1)
+                        ix2 = min(x2, gx2); iy2 = min(y2, gy2)
+                        inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+                        union = (w_box * h_box) + ((gx2-gx1)*(gy2-gy1)) - inter
+                        iou = inter / (union + 1e-6)
+                        
+                        if iou > 0.1: # Loose overlap required
+                            if best_det is None or conf > best_det['conf']:
+                                best_det = {
+                                    'bbox': [gx1, gy1, gx2, gy2],
+                                    'class': int(cls),
+                                    'conf': float(conf)
+                                }
+                                
+                    if best_det:
+                        # Extract features for this new detection
+                        # We need to call get_features_and_props for just this one
+                        # But get_features_and_props expects a list of bboxes and full frame
+                        # We can reuse the existing method
+                        
+                        # Create a temporary node
+                        # We will fill embedding later in batch or now
+                        # Let's do it now for simplicity
+                        embs, props = self.get_features_and_props(frame, [best_det['bbox']])
+                        
+                        # Create Node
+                        # Note: We don't assign the ID here, the Tracker will match it.
+                        # But since we searched FOR a specific slot, we strongly suspect it's that ID.
+                        # However, to keep architecture clean, we return it as a "candidate" 
+                        # and let the tracker merge it (or we force the ID if we are sure).
+                        # Let's return it as a candidate with a hint? 
+                        # For now, just a candidate.
+                        
+                        mass_norm, fric, rest = props[0]
+                        
+                        node = ObjectNode(
+                            id=-1, # Temporary
+                            class_id=best_det['class'],
+                            confidence=best_det['conf'],
+                            position=torch.tensor([(best_det['bbox'][0]+best_det['bbox'][2])/2, (best_det['bbox'][1]+best_det['bbox'][3])/2, 0.0], device=self.device),
+                            velocity=torch.zeros(3, device=self.device), # Unknown velocity initially
+                            bbox=torch.tensor(best_det['bbox'], device=self.device),
+                            embedding=embs[0],
+                            mass=mass_norm.item() * 10.0,
+                            friction=fric.item(),
+                            restitution=rest.item(),
+                            last_seen_timestamp=0.0 # Will be set by caller
+                        )
+                        # Add a hint about which slot triggered this
+                        node.attributes['suggested_id'] = slot['id']
+                        recovered_nodes.append(node)
+                        
+            except Exception as e:
+                print(f"VisualExpert: Refinement failed for slot {slot['id']} ({e})")
+                
+        return recovered_nodes

@@ -149,6 +149,48 @@ def run_inference(video_path: str, output_dir: str = "logs", device: str = None,
         # B. Memory & Tracking
         # 2. Associate with existing tracks
         tracked_nodes = memory.update(raw_nodes, timestamp)
+        
+        # --- FEEDBACK LOOP: Refine Lost Tracks ---
+        # Identify tracks that were NOT updated this frame (lost)
+        lost_tracks = [t for t in tracked_nodes if t.last_seen_timestamp < timestamp and t.is_active]
+        
+        if lost_tracks:
+            print(f"Memory: {len(lost_tracks)} tracks lost. Attempting targeted refinement...")
+            predicted_slots = []
+            dt = 1/30.0 # Assume 30fps for prediction
+            
+            for t in lost_tracks:
+                # Predict position based on velocity
+                # Simple linear prediction: P_new = P_old + V * dt
+                # Note: t.position is currently the OLD position (since it wasn't updated)
+                pred_pos = t.position + t.velocity * dt
+                
+                # Estimate bbox from position (assuming size stays same)
+                # We need the old bbox size
+                w = t.bbox[2] - t.bbox[0]
+                h = t.bbox[3] - t.bbox[1]
+                
+                # New bbox centered at pred_pos
+                # pred_pos is [cx, cy, z]
+                cx, cy = pred_pos[0].item(), pred_pos[1].item()
+                
+                pred_bbox = [cx - w/2, cy - h/2, cx + w/2, cy + h/2]
+                
+                predicted_slots.append({
+                    'id': t.id,
+                    'bbox': pred_bbox,
+                    'embedding': t.embedding
+                })
+            
+            # Call Visual Expert to search in these regions
+            recovered_nodes = visual_expert.refine_with_slots(frame, predicted_slots)
+            
+            if recovered_nodes:
+                print(f"VisualExpert: Recovered {len(recovered_nodes)} objects via refinement.")
+                # Update memory again with recovered nodes
+                # This will match them to the lost tracks (since they should be close to prediction)
+                tracked_nodes = memory.update(recovered_nodes, timestamp)
+        
         print(f"Memory: Tracking {len(tracked_nodes)} objects.")
         
         # Log Memory State
